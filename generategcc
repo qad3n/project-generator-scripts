@@ -51,13 +51,17 @@ done
 # language prompt
 if [[ -z $lang ]]; then
 	while :; do
-		echo -e "Supported languages:\n- c\n- cpp\n- asm"
-		read -rp "Enter language (c/cpp/asm) or 'exit': " lang
-		lang="${lang,,}"
-		case "$lang" in
-			c|cpp|asm) break ;;
-			exit|quit) log "Exiting."; exit ;;
-			*) warn "Unsupported '$lang'." ;;
+		echo "Supported languages:"
+		echo "  1) c"
+		echo "  2) cpp"
+		echo "  3) asm"
+		read -rsn1 -p "Select language [1-3]: " choice
+		echo
+		case "$choice" in
+			1) lang=c; break ;;
+			2) lang=cpp; break ;;
+			3) lang=asm; break ;;
+			*) warn "Invalid selection '$choice'." ;;
 		esac
 	done
 else
@@ -81,8 +85,15 @@ Language: $lang
 Directory: $(pwd)/$projectName
 EOF
 if ! $autoYes; then
-	read -rp "Proceed? [Y/n]: " ans; ans="${ans,,}"
-	[[ $ans =~ ^n ]] && { log "Aborted."; exit; }
+	while :; do
+		read -rsn1 -p "Proceed? [y/n]: " ans
+		echo
+		case "${ans,,}" in
+			y) break ;;
+			n) log "Aborted."; exit ;;
+			*) warn "Invalid selection '$ans'." ;;
+		esac
+	done
 fi
 
 # dir initialization
