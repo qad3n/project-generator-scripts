@@ -1,29 +1,23 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 IFS=$'\n\t'
-
-tmptrap() { rm -rf "${TMPDIR:-}/projsetup.*"; }
-trap tmptrap EXIT
 
 log() { printf "[✓] %s\n" "$*"; }
 warn() { printf "[!] %s\n" "$*"; }
 error() { printf "[✗] %s\n" "$*" >&2; exit 1; }
 
 require() { command -v "$1" &>/dev/null || error "Required '$1' not found."; }
-require cmake; require mkdir; require sed; require uname
+require cmake
 
 projectName=""
 lang=""
 autoYes=false
 cxxStandard=17
-asmCompiler=nasm
 
 sanitizeName() { local n="${1// /_}"; echo "${n//[^A-Za-z0-9_-]/}"; }
-getCores() { [[ $(uname -s) == Darwin* ]] && sysctl -n hw.logicalcpu || nproc; } # testing
 
 # usage help
-usage() 
+usage()
 {
 	cat <<EOF
 	Usage: $0 [options]
@@ -40,7 +34,7 @@ while (( $# )); do
 	case "$1" in
 		-n|--name) [[ $# -ge 2 ]] || usage; projectName=$(sanitizeName "$2"); shift 2;;
 		-l|--lang) [[ $# -ge 2 ]] || usage; lang="${2,,}"; shift 2;;
-		-y|--noconfirm) autoYes=true; shift;;
+		-y|--yes) autoYes=true; shift;;
 		-h|--help) usage;;
 		*) error "Unknown option: $1";;
 	esac
@@ -77,7 +71,7 @@ fi
 case "$lang" in
 	c) cmakeLang=C; ext=c ;;
 	cpp) cmakeLang=CXX; ext=cpp; require g++ ;;
-	asm) cmakeLang=ASM_NASM; ext=asm; require "$asmCompiler" ;;
+	asm) cmakeLang=ASM_NASM; ext=asm; require nasm ;;
 esac
 
 # confirm
@@ -93,7 +87,7 @@ fi
 
 # dir initialization
 log "Creating project structure..."
-mkdir -p "$projectName"/{src,include,out}
+mkdir -p "$projectName"/{src,include}
 cd "$projectName"
 
 # samples
@@ -109,20 +103,20 @@ EOF
 int main(){ std::cout<<"Hello, C++ World!\n"; return 0; }
 EOF
 	;;
-	asm) cat >"$srcFile" <<'EOF' # pasted asm example
+	asm) cat >"$srcFile" <<'EOF'
 global _start
 section .data
 	msg db "Hello, ASM World!",0x0A
 	len equ $-msg
 section .text
 _start:
-	mov rax,1; 
-	mov rdi,1; 
-	mov rsi,msg; 
-	mov rdx,len; 
+	mov rax,1;
+	mov rdi,1;
+	mov rsi,msg;
+	mov rdx,len;
 	syscall
-	mov rax,60; 
-	xor rdi,rdi; 
+	mov rax,60;
+	xor rdi,rdi;
 	syscall
 EOF
 	;;
@@ -130,46 +124,45 @@ esac
 log "Added $srcFile"
 
 # CMakeLists.txt
-cat > CMakeLists.txt <<'CMAKE_EOF'
-cmake_minimum_required(VERSION 3.16)
-project(__PROJECT__ LANGUAGES __LANG__)
+case "$cmakeLang" in
+	CXX)
+		stdBlock="set(CMAKE_CXX_STANDARD $cxxStandard)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)"
+		;;
+	C)
+		stdBlock="set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)"
+		;;
+	*) stdBlock="" ;;
+esac
 
-__STD_BLOCK__
+strictProtos=""
+[[ $cmakeLang == C ]] && strictProtos=" -Wstrict-prototypes"
+
+cat > CMakeLists.txt <<CMAKE_EOF
+cmake_minimum_required(VERSION 3.16)
+project($projectName LANGUAGES $cmakeLang)
+
+$stdBlock
 
 add_compile_options(
 	-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion
-	-Wcast-align -Wformat=2 -Wundef -Wstrict-prototypes
+	-Wcast-align -Wformat=2 -Wundef$strictProtos
 	-pedantic -fstack-protector-strong
 )
 
 include_directories(include)
 
 file(GLOB_RECURSE PROJECT_SOURCES CONFIGURE_DEPENDS
-	src/*.c
+	src/*.$ext
 )
 
-add_executable(${PROJECT_NAME} ${PROJECT_SOURCES})
+add_executable(\${PROJECT_NAME} \${PROJECT_SOURCES})
 
-set_target_properties(${PROJECT_NAME} PROPERTIES
-	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}"
+set_target_properties(\${PROJECT_NAME} PROPERTIES
+	RUNTIME_OUTPUT_DIRECTORY "\${CMAKE_SOURCE_DIR}"
 )
 CMAKE_EOF
-
-# placeholders
-sed -i "s/__PROJECT__/$projectName/" CMakeLists.txt
-sed -i "s/__LANG__/$cmakeLang/" CMakeLists.txt
-sed -i "s/__EXT__/$ext/" CMakeLists.txt
-
-# dynamic cmakelist variables, a little jank but it works
-if [[ $cmakeLang == CXX ]]; then
-	sed -i "s#__STD_BLOCK__#set(CMAKE_CXX_STANDARD $cxxStandard)\\
-set(CMAKE_CXX_STANDARD_REQUIRED ON)#" CMakeLists.txt
-elif [[ $cmakeLang == C ]]; then
-	sed -i 's#__STD_BLOCK__#set(CMAKE_C_STANDARD 11)\
-set(CMAKE_C_STANDARD_REQUIRED ON)#' CMakeLists.txt
-else
-	sed -i 's/__STD_BLOCK__//' CMakeLists.txt
-fi
 
 log "Initializing git repository..."
 git init -q
@@ -177,18 +170,19 @@ cat > .gitignore <<EOF
 /out*/
 /*.o
 /*.obj
+*.md
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
 EOF
 
-cores=$(getCores)
 cat > build <<EOF
+
 #!/usr/bin/env bash
 set -euo pipefail
 cmake -S . -B out -DCMAKE_BUILD_TYPE=\${1:-Release}
-cmake --build out --parallel "$cores"
+cmake --build out --parallel \$(nproc)
 EOF
 chmod +x build
 
@@ -196,5 +190,4 @@ log "Invoking initial build..."
 ./build
 ./"$projectName"
 
-trap - ERR
-log "Setup complete. Binary: out/$projectName"
+log "Setup complete. Binary: ./$projectName"
