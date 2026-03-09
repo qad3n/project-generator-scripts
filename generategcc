@@ -7,15 +7,9 @@ if [[ -t 0 ]]; then
 	trap 'printf "\e[<u" >/dev/tty 2>/dev/null || true' EXIT
 fi
 
-warn() { printf "[!] %s\n" "$*"; }
-
-if [[ "${LANG:-}${LC_ALL:-}" =~ [Uu][Tt][Ff] ]]; then
-	log() { printf "[✓] %s\n" "$*"; }
-	error() { printf "[✗] %s\n" "$*" >&2; exit 1; }
-else
-	log() { printf "[+] %s\n" "$*"; }
-	error() { printf "[-] %s\n" "$*" >&2; exit 1; }
-fi
+log()   { printf "[✓] %s\n" "$*"; }
+warn()  { printf "[!] %s\n" "$*"; }
+error() { printf "[✗] %s\n" "$*" >&2; exit 1; }
 
 require() { command -v "$1" &>/dev/null || error "Required '$1' not found."; }
 require cmake
