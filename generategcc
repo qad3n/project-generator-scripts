@@ -42,7 +42,7 @@ while (( $# )); do
 		-l|--lang) [[ $# -ge 2 ]] || usage; lang="${2,,}"; shift 2;;
 		-y|--yes) autoYes=true; shift;;
 		-h|--help) usage;;
-		*) error "Unknown option: $1";;
+		*) warn "Ignoring unknown argument '$1'."; shift;;
 	esac
 done
 
