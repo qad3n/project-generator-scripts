@@ -2,30 +2,42 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-log() { printf "[✓] %s\n" "$*"; }
+if [[ -t 0 ]]; then
+	printf '\e[>0u' >/dev/tty 2>/dev/null || true
+	trap 'printf "\e[<u" >/dev/tty 2>/dev/null || true' EXIT
+fi
+
 warn() { printf "[!] %s\n" "$*"; }
-error() { printf "[✗] %s\n" "$*" >&2; exit 1; }
+
+if [[ "${LANG:-}${LC_ALL:-}" =~ [Uu][Tt][Ff] ]]; then
+	log() { printf "[✓] %s\n" "$*"; }
+	error() { printf "[✗] %s\n" "$*" >&2; exit 1; }
+else
+	log() { printf "[+] %s\n" "$*"; }
+	error() { printf "[-] %s\n" "$*" >&2; exit 1; }
+fi
 
 require() { command -v "$1" &>/dev/null || error "Required '$1' not found."; }
 require cmake
+require git
 
 projectName=""
 lang=""
 autoYes=false
 cxxStandard=17
 
-sanitizeName() { local n="${1// /_}"; echo "${n//[^A-Za-z0-9_-]/}"; }
+sanitizeName() { local n="${1// /_}"; n="${n//-/_}"; printf '%s\n' "${n//[^A-Za-z0-9_]/}"; }
 
 # usage help
 usage()
 {
-	cat <<EOF
+	cat <<-EOF
 	Usage: $0 [options]
-		-n | --name <project>	Project name
-		-l | --lang <language> 	Language: c / cpp / asm
-		-y | --yes				Skip confirmation
-		-h | --help				Show this help
-EOF
+	  -n | --name <project>   Project name
+	  -l | --lang <language>  Language: c / cpp / asm
+	  -y | --yes              Skip confirmation
+	  -h | --help             Show this help
+	EOF
 	exit 1
 }
 
@@ -48,13 +60,15 @@ while [[ -z $projectName ]]; do
 	[[ -e $projectName ]] && { warn "Directory exists."; projectName=""; }
 done
 
+[[ -e $projectName ]] && error "Directory '$projectName' already exists."
+
 # language prompt
 if [[ -z $lang ]]; then
 	while :; do
 		echo "Supported languages:"
-		echo "  1) c"
-		echo "  2) cpp"
-		echo "  3) asm"
+		echo "  [1] c"
+		echo "  [2] cpp"
+		echo "  [3] asm"
 		read -rsn1 -p "Select language [1-3]: " choice
 		echo
 		case "$choice" in
@@ -71,18 +85,21 @@ else
 	esac
 fi
 
-# requirement check
+# requirement checks
 case "$lang" in
-	c) cmakeLang=C; ext=c ;;
+	c) cmakeLang=C; ext=c; require gcc ;;
 	cpp) cmakeLang=CXX; ext=cpp; require g++ ;;
-	asm) cmakeLang=ASM_NASM; ext=asm; require nasm ;;
+	asm)
+		[[ "$(uname -m)" == x86_64 ]] || error "ASM (NASM) is only supported on x86_64."
+		cmakeLang=ASM_NASM; ext=asm; require nasm; require ld
+		;;
 esac
 
 # confirm
 cat <<EOF
 Project: $projectName
 Language: $lang
-Directory: $(pwd)/$projectName
+Directory: $PWD/$projectName
 EOF
 if ! $autoYes; then
 	while :; do
@@ -96,7 +113,7 @@ if ! $autoYes; then
 	done
 fi
 
-# dir initialization
+# initialize structure
 log "Creating project structure..."
 mkdir -p "$projectName"/{src,include}
 cd "$projectName"
@@ -134,7 +151,7 @@ EOF
 esac
 log "Added $srcFile"
 
-# CMakeLists.txt
+# cmake setup
 case "$cmakeLang" in
 	CXX)
 		stdBlock="set(CMAKE_CXX_STANDARD $cxxStandard)
@@ -147,8 +164,16 @@ set(CMAKE_C_STANDARD_REQUIRED ON)"
 	*) stdBlock="" ;;
 esac
 
-strictProtos=""
-[[ $cmakeLang == C ]] && strictProtos=" -Wstrict-prototypes"
+flagsBlock=""
+if [[ $cmakeLang != ASM_NASM ]]; then
+	strictProtos=""
+	[[ $cmakeLang == C ]] && strictProtos=$'\n\t-Wstrict-prototypes'
+	flagsBlock="add_compile_options(
+	-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion
+	-Wcast-align -Wformat=2 -Wundef
+	-pedantic -fstack-protector-strong$strictProtos
+)"
+fi
 
 cat > CMakeLists.txt <<CMAKE_EOF
 cmake_minimum_required(VERSION 3.16)
@@ -156,11 +181,7 @@ project($projectName LANGUAGES $cmakeLang)
 
 $stdBlock
 
-add_compile_options(
-	-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion
-	-Wcast-align -Wformat=2 -Wundef$strictProtos
-	-pedantic -fstack-protector-strong
-)
+$flagsBlock
 
 include_directories(include)
 
@@ -181,20 +202,18 @@ cat > .gitignore <<EOF
 /out*/
 /*.o
 /*.obj
-*.md
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
 EOF
 
-cat > build <<EOF
-
+cat > build <<'BUILDEOF'
 #!/usr/bin/env bash
 set -euo pipefail
-cmake -S . -B out -DCMAKE_BUILD_TYPE=\${1:-Release}
-cmake --build out --parallel \$(nproc)
-EOF
+cmake -S . -B out -DCMAKE_BUILD_TYPE="${1:-Release}"
+cmake --build out --parallel "$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+BUILDEOF
 chmod +x build
 
 log "Invoking initial build..."
