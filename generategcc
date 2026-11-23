@@ -2,216 +2,260 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-if [[ -t 0 ]]; then
-	printf '\e[>0u' >/dev/tty 2>/dev/null || true
-	trap 'printf "\e[<u" >/dev/tty 2>/dev/null || true' EXIT
-fi
+readonly languages=(c cpp asm)
+# cmake reserved target names plus files the binary would overwrite in the project root
+readonly reservedNames=(all clean depend edit_cache help install package preinstall rebuild_cache build include out src)
+readonly strictFlags='-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion
+	-Wcast-align -Wformat=2 -Wundef -pedantic -fstack-protector-strong'
 
-log()   { printf "[✓] %s\n" "$*"; }
-warn()  { printf "[!] %s\n" "$*"; }
-error() { printf "[✗] %s\n" "$*" >&2; exit 1; }
+log()   { printf '[+] %s\n' "$*"; }
+warn()  { printf '[!] %s\n' "$*" >&2; }
+error() { printf '[x] %s\n' "$*" >&2; exit 1; }
 
 require() { command -v "$1" &>/dev/null || error "Required '$1' not found."; }
-require cmake
-require git
+contains() { local item; for item in "${@:2}"; do [[ $item == "$1" ]] && return 0; done; return 1; }
+sanitizeName() { local name="${1//[ -]/_}"; printf '%s\n' "${name//[^A-Za-z0-9_]/}"; }
+readKey() { read -rsn1 -p "$1" "$2" || error "No input."; echo; }
+
+usage()
+{
+	local IFS=/
+	cat <<-EOF
+	Usage: ${0##*/} [options]
+	  -n | --name <project>   Project name
+	  -l | --lang <language>  Language: ${languages[*]}
+	  -y | --yes              Skip confirmation
+	  -h | --help             Show this help
+	EOF
+	exit "${1:-0}"
+}
+
+langC()
+{
+	cmakeLang=C
+	ext=c
+	tools=(gcc)
+	arch=
+	standard=11
+	flags="$strictFlags -Wstrict-prototypes"
+	sample='#include <stdio.h>
+
+int main(void)
+{
+	puts("Hello, C World!");
+	return 0;
+}'
+}
+
+langCpp()
+{
+	cmakeLang=CXX
+	ext=cpp
+	tools=(g++)
+	arch=
+	standard=17
+	flags=$strictFlags
+	sample='#include <iostream>
+
+int main()
+{
+	std::cout << "Hello, C++ World!\n";
+	return 0;
+}'
+}
+
+langAsm()
+{
+	cmakeLang=ASM_NASM
+	ext=asm
+	tools=(nasm ld)
+	arch=x86_64
+	standard=
+	flags=
+	sample='global _start
+
+section .data
+	msg db "Hello, ASM World!", 0x0A
+	len equ $ - msg
+
+section .text
+_start:
+	mov rax, 1
+	mov rdi, 1
+	mov rsi, msg
+	mov rdx, len
+	syscall
+
+	mov rax, 60
+	xor rdi, rdi
+	syscall
+
+section .note.GNU-stack noalloc noexec nowrite progbits'
+}
+
+promptName()
+{
+	local input
+	while [[ -z $projectName ]]; do
+		read -rp "Enter project name: " input || error "No input."
+		projectName=$(sanitizeName "$input")
+		if [[ -z $projectName ]]; then
+			warn "Name cannot be empty."
+		elif contains "$projectName" "${reservedNames[@]}"; then
+			warn "Name '$projectName' is reserved."
+			projectName=""
+		elif [[ -e $projectName ]]; then
+			warn "Directory '$projectName' exists."
+			projectName=""
+		fi
+	done
+}
+
+promptLanguage()
+{
+	local i choice
+	echo "Supported languages:"
+	for i in "${!languages[@]}"; do
+		printf '  [%d] %s\n' $((i + 1)) "${languages[i]}"
+	done
+	while :; do
+		readKey "Select language [1-${#languages[@]}]: " choice
+		if [[ $choice == [1-9] ]] && (( choice <= ${#languages[@]} )); then
+			lang=${languages[choice - 1]}
+			return
+		fi
+		warn "Invalid selection '$choice'."
+	done
+}
+
+confirm()
+{
+	local answer
+	while :; do
+		readKey "Proceed? [y/n]: " answer
+		case "${answer,,}" in
+			y) return ;;
+			n) log "Aborted."; exit 0 ;;
+			*) warn "Invalid selection '$answer'." ;;
+		esac
+	done
+}
+
+writeCmake()
+{
+	local standardBlock="" flagsBlock=""
+	if [[ -n $standard ]]; then
+		standardBlock="set(CMAKE_${cmakeLang}_STANDARD $standard)
+set(CMAKE_${cmakeLang}_STANDARD_REQUIRED ON)
+set(CMAKE_${cmakeLang}_EXTENSIONS OFF)
+"
+	fi
+	if [[ -n $flags ]]; then
+		flagsBlock="target_compile_options(\${PROJECT_NAME} PRIVATE
+	$flags
+)
+"
+	fi
+
+	cat >CMakeLists.txt <<-EOF
+	cmake_minimum_required(VERSION 3.16)
+	project($projectName LANGUAGES $cmakeLang)
+
+	${standardBlock}set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+	file(GLOB_RECURSE sources CONFIGURE_DEPENDS src/*.$ext)
+	add_executable(\${PROJECT_NAME} \${sources})
+	target_include_directories(\${PROJECT_NAME} PRIVATE include)
+	${flagsBlock}set_target_properties(\${PROJECT_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "\${PROJECT_SOURCE_DIR}")
+	EOF
+}
+
+writeFiles()
+{
+	mkdir -p src include
+	printf '%s\n' "$sample" >"src/main.$ext"
+	writeCmake
+
+	cat >.gitignore <<-EOF
+	/out*/
+	/.cache/
+	/$projectName
+	EOF
+
+	cat >.clangd <<-'EOF'
+	CompileFlags:
+	  CompilationDatabase: out
+	EOF
+
+	cat >build <<-'EOF'
+	#!/usr/bin/env bash
+	set -euo pipefail
+	cd "$(dirname "$0")"
+	cmake -S . -B out -DCMAKE_BUILD_TYPE="${1:-Release}"
+	cmake --build out --parallel "$(nproc)"
+	EOF
+	chmod +x build
+}
 
 projectName=""
 lang=""
 autoYes=false
-cxxStandard=17
 
-sanitizeName() { local n="${1// /_}"; n="${n//-/_}"; printf '%s\n' "${n//[^A-Za-z0-9_]/}"; }
-
-# usage help
-usage()
-{
-	cat <<-EOF
-	Usage: $0 [options]
-	  -n | --name <project>   Project name
-	  -l | --lang <language>  Language: c / cpp / asm
-	  -y | --yes              Skip confirmation
-	  -h | --help             Show this help
-	EOF
-	exit 1
-}
-
-# commands
 while (( $# )); do
 	case "$1" in
-		-n|--name) [[ $# -ge 2 ]] || usage; projectName=$(sanitizeName "$2"); shift 2;;
-		-l|--lang) [[ $# -ge 2 ]] || usage; lang="${2,,}"; shift 2;;
-		-y|--yes) autoYes=true; shift;;
-		-h|--help) usage;;
-		*) warn "Ignoring unknown argument '$1'."; shift;;
+		-n|--name) [[ $# -ge 2 ]] || usage 1; projectName=$(sanitizeName "$2"); shift 2 ;;
+		-l|--lang) [[ $# -ge 2 ]] || usage 1; lang="${2,,}"; shift 2 ;;
+		-y|--yes) autoYes=true; shift ;;
+		-h|--help) usage ;;
+		*) warn "Ignoring unknown argument '$1'."; shift ;;
 	esac
 done
 
-# name prompt
-while [[ -z $projectName ]]; do
-	read -rp "Enter project name: " tmp
-	projectName=$(sanitizeName "$tmp")
-	[[ -z $projectName ]] && { warn "Name cannot be empty."; continue; }
-	[[ -e $projectName ]] && { warn "Directory exists."; projectName=""; }
-done
+require cmake
+require git
 
-[[ -e $projectName ]] && error "Directory '$projectName' already exists."
-
-# language prompt
-if [[ -z $lang ]]; then
-	while :; do
-		echo "Supported languages:"
-		echo "  [1] c"
-		echo "  [2] cpp"
-		echo "  [3] asm"
-		read -rsn1 -p "Select language [1-3]: " choice
-		echo
-		case "$choice" in
-			1) lang=c; break ;;
-			2) lang=cpp; break ;;
-			3) lang=asm; break ;;
-			*) warn "Invalid selection '$choice'." ;;
-		esac
-	done
-else
-	case "$lang" in
-		c|cpp|asm) ;;
-		*) error "Unsupported language '$lang'" ;;
-	esac
+if [[ -t 0 ]]; then
+	# disable the kitty keyboard protocol so single key reads return plain characters
+	printf '\e[>0u' >/dev/tty 2>/dev/null || true
+	trap 'printf "\e[<u" >/dev/tty 2>/dev/null || true' EXIT
 fi
 
-# requirement checks
-case "$lang" in
-	c) cmakeLang=C; ext=c; require gcc ;;
-	cpp) cmakeLang=CXX; ext=cpp; require g++ ;;
-	asm)
-		[[ "$(uname -m)" == x86_64 ]] || error "ASM (NASM) is only supported on x86_64."
-		cmakeLang=ASM_NASM; ext=asm; require nasm; require ld
-		;;
-esac
+if [[ -n $projectName ]]; then
+	contains "$projectName" "${reservedNames[@]}" && error "Name '$projectName' is reserved."
+	[[ -e $projectName ]] && error "Directory '$projectName' already exists."
+fi
+promptName
 
-# confirm
+if [[ -z $lang ]]; then
+	promptLanguage
+fi
+contains "$lang" "${languages[@]}" || error "Unsupported language '$lang'."
+"lang${lang^}"
+
+if [[ -n $arch && $(uname -m) != "$arch" ]]; then
+	error "$lang is only supported on $arch."
+fi
+for tool in "${tools[@]}"; do
+	require "$tool"
+done
+
 cat <<EOF
 Project: $projectName
 Language: $lang
 Directory: $PWD/$projectName
 EOF
 if ! $autoYes; then
-	while :; do
-		read -rsn1 -p "Proceed? [y/n]: " ans
-		echo
-		case "${ans,,}" in
-			y) break ;;
-			n) log "Aborted."; exit ;;
-			*) warn "Invalid selection '$ans'." ;;
-		esac
-	done
+	confirm
 fi
 
-# initialize structure
-log "Creating project structure..."
-mkdir -p "$projectName"/{src,include}
+log "Creating project..."
+mkdir "$projectName"
 cd "$projectName"
-
-# samples
-srcFile="src/main.$ext"
-case "$lang" in
-	c) cat >"$srcFile" <<'EOF'
-#include <stdio.h>
-int main(void){ puts("Hello, C World!"); return 0; }
-EOF
-	;;
-	cpp) cat >"$srcFile" <<'EOF'
-#include <iostream>
-int main(){ std::cout<<"Hello, C++ World!\n"; return 0; }
-EOF
-	;;
-	asm) cat >"$srcFile" <<'EOF'
-global _start
-section .data
-	msg db "Hello, ASM World!",0x0A
-	len equ $-msg
-section .text
-_start:
-	mov rax,1;
-	mov rdi,1;
-	mov rsi,msg;
-	mov rdx,len;
-	syscall
-	mov rax,60;
-	xor rdi,rdi;
-	syscall
-EOF
-	;;
-esac
-log "Added $srcFile"
-
-# cmake setup
-case "$cmakeLang" in
-	CXX)
-		stdBlock="set(CMAKE_CXX_STANDARD $cxxStandard)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)"
-		;;
-	C)
-		stdBlock="set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)"
-		;;
-	*) stdBlock="" ;;
-esac
-
-flagsBlock=""
-if [[ $cmakeLang != ASM_NASM ]]; then
-	strictProtos=""
-	[[ $cmakeLang == C ]] && strictProtos=$'\n\t-Wstrict-prototypes'
-	flagsBlock="add_compile_options(
-	-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion
-	-Wcast-align -Wformat=2 -Wundef
-	-pedantic -fstack-protector-strong$strictProtos
-)"
-fi
-
-cat > CMakeLists.txt <<CMAKE_EOF
-cmake_minimum_required(VERSION 3.16)
-project($projectName LANGUAGES $cmakeLang)
-
-$stdBlock
-
-$flagsBlock
-
-include_directories(include)
-
-file(GLOB_RECURSE PROJECT_SOURCES CONFIGURE_DEPENDS
-	src/*.$ext
-)
-
-add_executable(\${PROJECT_NAME} \${PROJECT_SOURCES})
-
-set_target_properties(\${PROJECT_NAME} PROPERTIES
-	RUNTIME_OUTPUT_DIRECTORY "\${CMAKE_SOURCE_DIR}"
-)
-CMAKE_EOF
-
-log "Initializing git repository..."
+writeFiles
 git init -q
-cat > .gitignore <<EOF
-/out*/
-/*.o
-/*.obj
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-EOF
 
-cat > build <<'BUILDEOF'
-#!/usr/bin/env bash
-set -euo pipefail
-cmake -S . -B out -DCMAKE_BUILD_TYPE="${1:-Release}"
-cmake --build out --parallel "$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-BUILDEOF
-chmod +x build
-
-log "Invoking initial build..."
+log "Building..."
 ./build
 ./"$projectName"
 
-log "Setup complete. Binary: ./$projectName"
+log "Setup complete. Binary: $projectName/$projectName"
