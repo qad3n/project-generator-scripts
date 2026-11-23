@@ -2,9 +2,9 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly languages=(c cpp asm)
+readonly languages=(c cpp asm rust)
 # cmake reserved target names plus files the binary would overwrite in the project root
-readonly reservedNames=(all clean depend edit_cache help install package preinstall rebuild_cache build include out src)
+readonly cmakeReserved=(all clean depend edit_cache help install package preinstall rebuild_cache build include out src)
 readonly strictFlags='-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion
 	-Wcast-align -Wformat=2 -Wundef -pedantic -fstack-protector-strong'
 
@@ -32,10 +32,12 @@ usage()
 
 langC()
 {
+	create=createCmake
+	tools=(cmake gcc)
+	reserved=("${cmakeReserved[@]}")
+	arch=
 	cmakeLang=C
 	ext=c
-	tools=(gcc)
-	arch=
 	standard=11
 	flags="$strictFlags -Wstrict-prototypes"
 	sample='#include <stdio.h>
@@ -49,10 +51,12 @@ int main(void)
 
 langCpp()
 {
+	create=createCmake
+	tools=(cmake g++)
+	reserved=("${cmakeReserved[@]}")
+	arch=
 	cmakeLang=CXX
 	ext=cpp
-	tools=(g++)
-	arch=
 	standard=17
 	flags=$strictFlags
 	sample='#include <iostream>
@@ -66,10 +70,12 @@ int main()
 
 langAsm()
 {
+	create=createCmake
+	tools=(cmake nasm ld)
+	reserved=("${cmakeReserved[@]}")
+	arch=x86_64
 	cmakeLang=ASM_NASM
 	ext=asm
-	tools=(nasm ld)
-	arch=x86_64
 	standard=
 	flags=
 	sample='global _start
@@ -93,21 +99,38 @@ _start:
 section .note.GNU-stack noalloc noexec nowrite progbits'
 }
 
+langRust()
+{
+	create=createCargo
+	tools=(cargo)
+	# cargo validates package names itself before creating anything
+	reserved=()
+	arch=
+	sample='fn main() {
+    println!("Hello, Rust World!");
+}'
+}
+
+nameProblem()
+{
+	if [[ -z $1 ]]; then
+		echo "Name cannot be empty."
+	elif contains "$1" "${reserved[@]}"; then
+		echo "Name '$1' is reserved."
+	elif [[ -e $1 ]]; then
+		echo "Directory '$1' already exists."
+	fi
+}
+
 promptName()
 {
-	local input
-	while [[ -z $projectName ]]; do
+	local input problem
+	while :; do
 		read -rp "Enter project name: " input || error "No input."
 		projectName=$(sanitizeName "$input")
-		if [[ -z $projectName ]]; then
-			warn "Name cannot be empty."
-		elif contains "$projectName" "${reservedNames[@]}"; then
-			warn "Name '$projectName' is reserved."
-			projectName=""
-		elif [[ -e $projectName ]]; then
-			warn "Directory '$projectName' exists."
-			projectName=""
-		fi
+		problem=$(nameProblem "$projectName")
+		[[ -z $problem ]] && return
+		warn "$problem"
 	done
 }
 
@@ -141,7 +164,7 @@ confirm()
 	done
 }
 
-writeCmake()
+writeCmakeLists()
 {
 	local standardBlock="" flagsBlock=""
 	if [[ -n $standard ]]; then
@@ -170,11 +193,13 @@ set(CMAKE_${cmakeLang}_EXTENSIONS OFF)
 	EOF
 }
 
-writeFiles()
+createCmake()
 {
-	mkdir -p src include
+	mkdir -p "$projectName"/{src,include}
+	cd "$projectName"
+	git init -q
 	printf '%s\n' "$sample" >"src/main.$ext"
-	writeCmake
+	writeCmakeLists
 
 	cat >.gitignore <<-EOF
 	/out*/
@@ -195,6 +220,62 @@ writeFiles()
 	cmake --build out --parallel "$(nproc)"
 	EOF
 	chmod +x build
+
+	log "Building..."
+	./build
+	./"$projectName"
+}
+
+createCargo()
+{
+	cargo new --quiet --vcs git "$projectName"
+	cd "$projectName"
+	printf '%s\n' "$sample" >src/main.rs
+
+	# camelCase function names need non_snake_case allowed
+	cat >>Cargo.toml <<-'EOF'
+
+	[lints.rust]
+	unsafe_code = "deny"
+	non_snake_case = "allow"
+
+	[lints.clippy]
+	unwrap_used = "deny"
+	expect_used = "deny"
+	todo = "deny"
+	unimplemented = "deny"
+	panic = "deny"
+	unused_result_ok = "deny"
+	let_underscore_must_use = "deny"
+	EOF
+
+	# unstable keys need cargo +nightly fmt
+	cat >rustfmt.toml <<-'EOF'
+	edition = "2024"
+	unstable_features = true
+	max_width = 120
+	use_small_heuristics = "Max"
+	single_line_if_else_max_width = 50
+	tab_spaces = 4
+	newline_style = "Unix"
+	fn_single_line = true
+	where_single_line = true
+	empty_item_single_line = true
+	hex_literal_case = "Upper"
+	imports_granularity = "Module"
+	group_imports = "One"
+	use_field_init_shorthand = true
+	blank_lines_upper_bound = 1
+	EOF
+
+	cat >clippy.toml <<-'EOF'
+	allow-unwrap-in-tests = true
+	allow-expect-in-tests = true
+	allow-panic-in-tests = true
+	EOF
+
+	log "Building..."
+	cargo run --quiet
 }
 
 projectName=""
@@ -211,7 +292,6 @@ while (( $# )); do
 	esac
 done
 
-require cmake
 require git
 
 if [[ -t 0 ]]; then
@@ -219,12 +299,6 @@ if [[ -t 0 ]]; then
 	printf '\e[>0u' >/dev/tty 2>/dev/null || true
 	trap 'printf "\e[<u" >/dev/tty 2>/dev/null || true' EXIT
 fi
-
-if [[ -n $projectName ]]; then
-	contains "$projectName" "${reservedNames[@]}" && error "Name '$projectName' is reserved."
-	[[ -e $projectName ]] && error "Directory '$projectName' already exists."
-fi
-promptName
 
 if [[ -z $lang ]]; then
 	promptLanguage
@@ -239,6 +313,12 @@ for tool in "${tools[@]}"; do
 	require "$tool"
 done
 
+if [[ -z $projectName ]]; then
+	promptName
+fi
+problem=$(nameProblem "$projectName")
+[[ -z $problem ]] || error "$problem"
+
 cat <<EOF
 Project: $projectName
 Language: $lang
@@ -249,13 +329,6 @@ if ! $autoYes; then
 fi
 
 log "Creating project..."
-mkdir "$projectName"
-cd "$projectName"
-writeFiles
-git init -q
+"$create"
 
-log "Building..."
-./build
-./"$projectName"
-
-log "Setup complete. Binary: $projectName/$projectName"
+log "Setup complete in $projectName/"
